@@ -1,7 +1,9 @@
 import fnmatch
 import logging
 import os
+from urlparse import urlparse
 
+from distlib.version import UnsupportedVersionError
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
@@ -11,10 +13,12 @@ from django.utils.translation import ugettext_lazy as _
 
 from guardian.shortcuts import assign, get_objects_for_user
 
+from betterversion.better import version_windows, BetterVersion
 from projects import constants
 from projects.exceptions import ProjectImportError
 from projects.templatetags.projects_tags import sort_version_aware
-from projects.utils import highest_version as _highest, make_api_version
+from projects.utils import (highest_version as _highest, make_api_version,
+                            symlink, update_static_metadata)
 from taggit.managers import TaggableManager
 from tastyapi.slum import api
 
@@ -42,7 +46,7 @@ class ProjectManager(models.Manager):
             # Add in possible user-specific views
             user_queryset = get_objects_for_user(user, 'projects.view_project')
             queryset = user_queryset | queryset
-        return queryset.filter(skip=False)
+        return queryset.filter()
 
     def live(self, *args, **kwargs):
         base_qs = self.filter(skip=False)
@@ -50,14 +54,14 @@ class ProjectManager(models.Manager):
 
     def public(self, user=None, *args, **kwargs):
         """
-        Query for projects, privacy_level == public, and skip = False
+        Query for projects, privacy_level == public
         """
         queryset = self._filter_queryset(user, privacy_level=constants.PUBLIC)
         return queryset.filter(*args, **kwargs)
 
     def protected(self, user=None, *args, **kwargs):
         """
-        Query for projects, privacy_level != private, and skip = False
+        Query for projects, privacy_level != private
         """
         queryset = self._filter_queryset(user,
                                          privacy_level=(constants.PUBLIC,
@@ -66,7 +70,7 @@ class ProjectManager(models.Manager):
 
     def private(self, user=None, *args, **kwargs):
         """
-        Query for projects, privacy_level != private, and skip = False
+        Query for projects, privacy_level != private
         """
         queryset = self._filter_queryset(user, privacy_level=constants.PRIVATE)
         return queryset.filter(*args, **kwargs)
@@ -109,6 +113,9 @@ class Project(models.Model):
     project_url = models.URLField(_('Project URL'), blank=True,
                                   help_text=_('The project\'s homepage'),
                                   verify_exists=False)
+    canonical_url = models.URLField(_('Canonical URL'), blank=True,
+                                  help_text=_('The official URL that the docs live at. This can be at readthedocs.org, or somewhere else. Ex. http://docs.fabfile.org'),
+                                  verify_exists=False)
     version = models.CharField(_('Version'), max_length=100, blank=True,
                                help_text=_('Project version these docs apply '
                                            'to, i.e. 1.0a'))
@@ -121,6 +128,9 @@ class Project(models.Model):
                    'themes" target="_blank">%s</a>') % _('Examples'))
     suffix = models.CharField(_('Suffix'), max_length=10, editable=False,
                               default='.rst')
+    single_version = models.BooleanField(
+        _('Single version'), default=False,
+        help_text=_('A single version site has no translations and only your "latest" version, served at the root of the domain. Use this with caution, only turn it on if you will <b>never</b> have multiple versions of your docs.'))
     default_version = models.CharField(
         _('Default version'), max_length=255, default='latest',
         help_text=_('The version of your project that / redirects to'))
@@ -135,7 +145,7 @@ class Project(models.Model):
         _('Requirements file'), max_length=255, default=None, null=True,
         blank=True, help_text=_(
             'Requires Virtualenv. A <a '
-            'href="http://www.pip-installer.org/en/latest/requirements.html">'
+            'href="http://www.pip-installer.org/en/latest/cookbook.html#requirements-files">'
             'pip requirements file</a> needed to build your documentation. '
             'Path from the root of your project.'))
     documentation_type = models.CharField(
@@ -159,6 +169,7 @@ class Project(models.Model):
 
     featured = models.BooleanField(_('Featured'))
     skip = models.BooleanField(_('Skip'))
+    mirror = models.BooleanField(_('Mirror'), default=False)
     use_virtualenv = models.BooleanField(
         _('Use virtualenv'),
         help_text=_("Install your project inside a virtualenv using setup.py "
@@ -177,10 +188,9 @@ class Project(models.Model):
     use_system_packages = models.BooleanField(
         _('Use system packages'),
         help_text=_("Give the virtual environment access to the global "
-                    "sites-packages dir."))
+                    "site-packages dir."))
     django_packages_url = models.CharField(_('Django Packages URL'),
                                            max_length=255, blank=True)
-    crate_url = models.CharField(_('Crate URL'), max_length=255, blank=True)
     privacy_level = models.CharField(
         _('Privacy Level'), max_length=20, choices=constants.PRIVACY_CHOICES,
         default='public',
@@ -212,7 +222,7 @@ class Project(models.Model):
     num_major = models.IntegerField(
         _('Number of Major versions'), 
         max_length=3,
-        default=None,
+        default=2,
         null=True,
         blank=True,
         help_text=_("2 means supporting 3.X.X and 2.X.X, but not 1.X.X")
@@ -220,7 +230,7 @@ class Project(models.Model):
     num_minor = models.IntegerField(
         _('Number of Minor versions'), 
         max_length=3,
-        default=None,
+        default=2,
         null=True,
         blank=True,
         help_text=_("2 means supporting 2.2.X and 2.1.X, but not 2.0.X")
@@ -228,7 +238,7 @@ class Project(models.Model):
     num_point = models.IntegerField(
         _('Number of Point versions'), 
         max_length=3,
-        default=None,
+        default=2,
         null=True,
         blank=True,
         help_text=_("2 means supporting 2.2.2 and 2.2.1, but not 2.2.0")
@@ -251,18 +261,20 @@ class Project(models.Model):
     @property
     def subdomain(self):
         prod_domain = getattr(settings, 'PRODUCTION_DOMAIN')
-        subdomain_slug = self.slug.replace('_', '-')
-        return "%s.%s" % (subdomain_slug, prod_domain)
+        if self.canonical_domain:
+            return self.canonical_domain
+        else:
+            subdomain_slug = self.slug.replace('_', '-')
+            return "%s.%s" % (subdomain_slug, prod_domain)
+
+    def sync_supported_versions(self):
+        supported = self.supported_versions(flat=True)
+        if supported:
+            self.versions.filter(verbose_name__in=supported).update(supported=True)
+            self.versions.exclude(verbose_name__in=supported).update(supported=False)
+            self.versions.filter(verbose_name='latest').update(supported=True)
 
     def save(self, *args, **kwargs):
-        #if hasattr(self, 'pk'):
-            #previous_obj = self.__class__.objects.get(pk=self.pk)
-            #if previous_obj.repo != self.repo:
-                #Needed to not have an import loop on Project
-                #from projects import tasks
-                #This needs to run on the build machine.
-                #tasks.remove_dir.delay(os.path.join(self.doc_path,
-                                                    #'checkouts'))
         if not self.slug:
             # Subdomains can't have underscores in them.
             self.slug = slugify(self.name).replace('_','-')
@@ -271,6 +283,20 @@ class Project(models.Model):
         obj = super(Project, self).save(*args, **kwargs)
         for owner in self.users.all():
             assign('view_project', owner, self)
+
+        # Add exceptions here for safety
+        try:
+            self.sync_supported_versions()
+        except Exception, e:
+            log.error('failed to sync supported versions', exc_info=True)
+        try:
+            symlink(project=self.slug)
+        except Exception, e:
+            log.error('failed to symlink project', exc_info=True)
+        try:
+            update_static_metadata(project_pk=self.pk)
+        except Exception:
+            log.error('failed to update static metadata', exc_info=True)
         return obj
 
     def get_absolute_url(self):
@@ -286,19 +312,31 @@ class Project(models.Model):
         lang = lang_slug or self.language
         use_subdomain = getattr(settings, 'USE_SUBDOMAIN', False)
         if use_subdomain:
-            return "%s://%s/%s/%s/" % (
-                protocol,
-                self.subdomain,
-                lang,
-                version,
-            )
+            if self.single_version:
+                return "%s://%s/" % (
+                    protocol,
+                    self.subdomain,
+                )
+            else:
+                return "%s://%s/%s/%s/" % (
+                    protocol,
+                    self.subdomain,
+                    lang,
+                    version,
+                )
         else:
-            return reverse('docs_detail', kwargs={
-                'project_slug': self.slug,
-                'lang_slug': lang,
-                'version_slug': version,
-                'filename': ''
-            })
+            if self.single_version:
+                return reverse('docs_detail', kwargs={
+                    'project_slug': self.slug,
+                    'filename': ''
+                })
+            else:
+                return reverse('docs_detail', kwargs={
+                    'project_slug': self.slug,
+                    'lang_slug': lang,
+                    'version_slug': version,
+                    'filename': ''
+                })
 
     def get_translation_url(self, version_slug=None):
         parent = self.main_language_project
@@ -389,16 +427,50 @@ class Project(models.Model):
                             '%s.xml' % self.doc_name)
         return path
 
+    def get_downloads(self, version_slug='latest'):
+        downloads = {}
+        downloads['htmlzip'] = self.get_htmlzip_url()
+        downloads['epub'] = self.get_epub_url()
+        downloads['pdf'] = self.get_pdf_url()
+        downloads['manpage'] = self.get_manpage_url()
+        downloads['dash'] = self.get_dash_url()
+        return downloads
+
     @property
     def doc_name(self):
-        return self.slug
+        return self.slug.replace('_', '-')
+
+    @property
+    def canonical_domain(self):
+        if not self.clean_canonical_url:
+            return ""
+        return urlparse(self.clean_canonical_url).netloc
+
+    @property
+    def clean_canonical_url(self):
+        if not self.canonical_url:
+            return ""
+        parsed = urlparse(self.canonical_url)
+        if parsed.scheme:
+            scheme, netloc = parsed.scheme, parsed.netloc
+        elif parsed.netloc:
+            scheme, netloc = "http", parsed.netloc
+        else:
+            scheme, netloc = "http", parsed.path
+        return "%s://%s/" % (scheme, netloc)
+
+    @property
+    def clean_repo(self):
+        if self.repo.startswith('http://github.com'):
+            return self.repo.replace('http://github.com', 'https://github.com')
+        return self.repo
 
     #Doc PATH:
     #MEDIA_ROOT/slug/checkouts/version/<repo>
 
     @property
     def doc_path(self):
-        return os.path.join(settings.DOCROOT, self.slug)
+        return os.path.join(settings.DOCROOT, self.slug.replace('_', '-'))
 
     def checkout_path(self, version='latest'):
         return os.path.join(self.doc_path, 'checkouts', version)
@@ -406,10 +478,40 @@ class Project(models.Model):
     def venv_path(self, version='latest'):
         return os.path.join(self.doc_path, 'envs', version)
 
-    def translations_path(self, language=None):
+    #
+    # Paths for symlinks in project doc_path.
+    # 
+    def cnames_symlink_path(self, domain):
+        """
+        Path in the doc_path that we symlink cnames
+
+        This has to be at the top-level because Nginx doesn't know the projects slug.
+        """
+        return os.path.join(settings.CNAME_ROOT, domain)
+
+    def translations_symlink_path(self, language=None):
+        """
+        Path in the doc_path that we symlink translations
+        """
         if not language:
             language = self.language
         return os.path.join(self.doc_path, 'translations', language)
+
+    def subprojects_symlink_path(self, project):
+        """
+        Path in the doc_path that we symlink subprojects
+        """
+        return os.path.join(self.doc_path, 'subprojects', project)
+
+    def single_version_symlink_path(self):
+        """
+        Path in the doc_path for the single_version symlink.
+        """
+        return os.path.join(self.doc_path, 'single_version')
+
+    #
+    # End symlink paths
+    #
 
     def venv_bin(self, version='latest', bin='python'):
         return os.path.join(self.venv_path(version), 'bin', bin)
@@ -439,13 +541,13 @@ class Project(models.Model):
 
     def full_man_path(self, version='latest'):
         """
-        The path to the build latex docs in the project.
+        The path to the build man docs in the project.
         """
         return os.path.join(self.conf_dir(version), "_build", "man")
 
     def full_epub_path(self, version='latest'):
         """
-        The path to the build latex docs in the project.
+        The path to the build epub docs in the project.
         """
         return os.path.join(self.conf_dir(version), "_build", "epub")
 
@@ -457,21 +559,27 @@ class Project(models.Model):
 
     def full_json_path(self, version='latest'):
         """
-        The path to the build dash docs in the project.
+        The path to the build json docs in the project.
         """
         return os.path.join(self.conf_dir(version), "_build", "json")
 
+    def full_singlehtml_path(self, version='latest'):
+        """
+        The path to the build singlehtml docs in the project.
+        """
+        return os.path.join(self.conf_dir(version), "_build", "singlehtml")
+
     def rtd_build_path(self, version="latest"):
         """
-        The path to the build html docs in the project.
+        The destination path where the built docs are copied.
         """
         return os.path.join(self.doc_path, 'rtd-builds', version)
 
-    def rtd_cname_path(self, cname):
+    def static_metadata_path(self):
         """
-        The path to the build html docs in the project.
+        The path to the static metadata JSON settings file
         """
-        return os.path.join(settings.CNAME_ROOT, cname)
+        return os.path.join(self.doc_path, 'metadata.json')
 
     def conf_file(self, version='latest'):
         if self.conf_py_file:
@@ -487,7 +595,9 @@ class Project(models.Model):
                 if file.find('doc', 70) != -1:
                     return file
         else:
-            raise ProjectImportError(_("Conf File Missing."))
+            # Having this be translatable causes this odd error:
+            # ProjectImportError(<django.utils.functional.__proxy__ object at 0x1090cded0>,)
+            raise ProjectImportError(u"Conf File Missing. Please make sure you have a conf.py in your project.")
 
     def conf_dir(self, version='latest'):
         conf_file = self.conf_file(version)
@@ -541,7 +651,7 @@ class Project(models.Model):
             repo = None
         else:
             proj = VCSProject(self.name, self.default_branch,
-                              self.checkout_path(version), self.repo)
+                              self.checkout_path(version), self.clean_repo)
             repo = backend(proj, version)
         #self._vcs_repo = repo
         return repo
@@ -557,8 +667,8 @@ class Project(models.Model):
         self._contribution_backend = cb
         return cb
 
-    def repo_lock(self, timeout=5, polling_interval=0.2):
-        return Lock(self, timeout, polling_interval)
+    def repo_lock(self, version, timeout=5, polling_interval=5):
+        return Lock(self, version, timeout, polling_interval)
 
     def find(self, file, version):
         """
@@ -607,6 +717,30 @@ class Project(models.Model):
 
         """
         return self.versions.filter(active=True)
+
+    def supported_versions(self, flat=True):
+        """
+        Get the list of supported versions.
+        Returns a list of version strings.
+        """
+        if not self.num_major or not self.num_minor or not self.num_point:
+            return None
+        versions = []
+        for ver in self.versions.all():
+            try:
+                versions.append(BetterVersion(ver.verbose_name))
+            except UnsupportedVersionError:
+                # Probably a branch
+                pass
+        active_versions = version_windows(
+            versions,
+            major=self.num_major,
+            minor=self.num_minor,
+            point=self.num_point,
+            flat=flat,
+        )
+        version_strings = [v._string for v in active_versions]
+        return version_strings
 
     def version_from_branch_name(self, branch):
         try:

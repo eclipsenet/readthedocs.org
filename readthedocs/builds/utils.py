@@ -7,9 +7,9 @@ GH_REGEXS = [
 ]
 
 BB_REGEXS = [
-    re.compile('bitbucket.com/(.+)/(.+)/'),
-    re.compile('bitbucket.com/(.+)/(.+)'),
-    re.compile('bitbucket.com:(.+)/(.+)\.git'),
+    re.compile('bitbucket.org/(.+)/(.+)/'),
+    re.compile('bitbucket.org/(.+)/(.+)'),
+    re.compile('bitbucket.org:(.+)/(.+)\.git'),
 ]
 
 def get_github_username_repo(version):
@@ -30,14 +30,22 @@ def get_bitbucket_username_repo(version):
                 return match.groups()
     return (None, None)
 
-def get_vcs_version(version):
+def get_vcs_version_slug(version):
+    slug = None
     if version.slug == 'latest':
         if version.project.default_branch:
-            return version.project.default_branch
+            slug = version.project.default_branch
         else:
-            return version.project.vcs_repo().fallback_branch
+            slug = version.project.vcs_repo().fallback_branch
     else:
-        return version.slug
+        slug = version.slug
+    # https://github.com/rtfd/readthedocs.org/issues/561
+    # version identifiers with / characters in branch name need to un-slugify
+    # the branch name for remote links to work
+    if slug.replace('-', '/') in version.identifier:
+        slug = slug.replace('-', '/')
+    return slug
+
 
 def get_conf_py_path(version):
     conf_py_path = version.project.conf_file(version.slug)

@@ -74,15 +74,19 @@ context = {
     'MEDIA_URL': "{{ settings.MEDIA_URL }}",
     'PRODUCTION_DOMAIN': "{{ settings.PRODUCTION_DOMAIN }}",
     'versions': [{% for version in versions|sort_version_aware %}
-    ("{{ version.slug }}", "/en/{{ version.slug }}/"),{% endfor %}
+    ("{{ version.slug }}", "/{{ version.project.language }}/{{ version.slug}}/"),{% endfor %}
     ],
     'downloads': [ {% for key, val in downloads.items %}
     ("{{ key }}", "{{ val }}"),{% endfor %}
     ],
     'slug': '{{ project.slug }}',
     'name': u'{{ project.name }}',
+    'rtd_language': u'{{ project.language }}',
+    'canonical_url': '{{ project.clean_canonical_url }}',
     'analytics_code': '{{ project.analytics_code }}',
+    'single_version': {{ project.single_version }},
     'conf_py_path': '{{ conf_py_path }}',
+    'api_host': '{{ api_host }}',
     'github_user': '{{ github_user }}',
     'github_repo': '{{ github_repo }}',
     'github_version': '{{ github_version }}',
@@ -99,9 +103,8 @@ else:
 # Add custom RTD extension
 if 'extensions' in globals():
     extensions.append("readthedocs_ext.readthedocs")
-    extensions.append("readthedocs_ext.readthedocshtmldir")
 else:
-    extensions = ["readthedocs_ext.readthedocs", "readthedocs_ext.readthedocshtmldir"]
+    extensions = ["readthedocs_ext.readthedocs"]
 """
 
 TEMPLATE_DIR = '%s/readthedocs/templates/sphinx' % settings.SITE_ROOT
@@ -124,7 +127,7 @@ class Builder(BaseBuilder):
                               encoding='utf-8', mode='a')
         outfile.write("\n")
         conf_py_path = version_utils.get_conf_py_path(self.version)
-        remote_version = version_utils.get_vcs_version(self.version)
+        remote_version = version_utils.get_vcs_version_slug(self.version)
         github_info = version_utils.get_github_username_repo(self.version)
         bitbucket_info = version_utils.get_bitbucket_username_repo(self.version)
         if github_info[0] is None:
@@ -146,6 +149,7 @@ class Builder(BaseBuilder):
             'template_path': TEMPLATE_DIR,
             'conf_py_path': conf_py_path,
             'downloads': apiv2.version(self.version.pk).downloads.get()['downloads'],
+            'api_host': getattr(settings, 'SLUMBER_API_HOST', 'https://readthedocs.org'),
             # GitHub
             'github_user': github_info[0],
             'github_repo': github_info[1],
@@ -183,32 +187,9 @@ class Builder(BaseBuilder):
             build_command = ("sphinx-build %s -b readthedocs -D language=%s . _build/html"
                              % (force_str, project.language))
         build_results = run(build_command, shell=True)
-        self._zip_html()
         if 'no targets are out of date.' in build_results[1]:
             self._changed = False
         return build_results
-
-    @restoring_chdir
-    def _zip_html(self, **kwargs):
-        from_path = self.version.project.full_build_path(self.version.slug)
-        to_path = self.version.project.checkout_path(self.version.slug)
-        to_file = os.path.join(to_path, '%s.zip' % self.version.project.slug)
-
-        log.info("Creating zip file from %s" % from_path)
-        # Create a <slug>.zip file containing all files in file_path
-        os.chdir(from_path)
-        archive = zipfile.ZipFile(to_file, 'w')
-        for root, subfolders, files in os.walk('.'):
-            for file in files:
-                to_write = os.path.join(root, file)
-                archive.write(
-                    filename=to_write,
-                    arcname=os.path.join("%s-%s" % (self.version.project.slug,
-                                                    self.version.slug),
-                                         to_write)
-                )
-        archive.close()
-        return to_file
 
     def move(self, **kwargs):
         project = self.version.project
@@ -240,11 +221,12 @@ class Builder(BaseBuilder):
                 to_file = os.path.join(to_path, '%s.zip' % project.slug)
                 from_path = project.checkout_path(self.version.slug)
                 from_file = os.path.join(from_path, '%s.zip' % project.slug)
-                if getattr(settings, "MULTIPLE_APP_SERVERS", None):
-                    copy_file_to_app_servers(from_file, to_file)
-                else:
-                    if not os.path.exists(to_path):
-                        os.makedirs(to_path)
-                    run('mv -f %s %s' % (from_file, to_file))
+                if os.path.exists(from_file):
+                    if getattr(settings, "MULTIPLE_APP_SERVERS", None):
+                        copy_file_to_app_servers(from_file, to_file)
+                    else:
+                        if not os.path.exists(to_path):
+                            os.makedirs(to_path)
+                        run('mv -f %s %s' % (from_file, to_file))
         else:
             log.warning("Not moving docs, because the build dir is unknown.")

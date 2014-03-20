@@ -13,8 +13,6 @@ from core.views import SearchView
 from projects.feeds import LatestProjectsFeed, NewProjectsFeed
 from projects.filters import ProjectFilter
 from projects.constants import LANGUAGES_REGEX
-from restapi.urls import router
-
 
 v1_api = Api(api_name='v1')
 v1_api.register(BuildResource())
@@ -22,9 +20,6 @@ v1_api.register(UserResource())
 v1_api.register(ProjectResource())
 v1_api.register(VersionResource())
 v1_api.register(FileResource())
-
-# API v2
-
 
 admin.autodiscover()
 
@@ -42,25 +37,32 @@ urlpatterns = patterns(
         'core.views.serve_docs',
         name='docs_detail'),
 
+    # Redirect to default version, if only lang_slug is set.
+    url((r'^docs/(?P<project_slug>[-\w]+)/(?P<lang_slug>%s)/$') % LANGUAGES_REGEX,
+        'core.views.redirect_lang_slug',
+        name='docs_detail'),
+
+    # Redirect to default version, if only version_slug is set.
+    url(r'^docs/(?P<project_slug>[-\w]+)/(?P<version_slug>[-._\w]+)/$',
+        'core.views.redirect_version_slug',
+        name='docs_detail'),
+
     # Redirect to default version.
     url(r'^docs/(?P<project_slug>[-\w]+)/$',
-        'core.views.serve_docs',
-        {
-            'version_slug': None,
-            'lang_slug': None,
-            'filename': '',
-        },
+        'core.views.redirect_project_slug',
         name='docs_detail'),
 
     # Handle /page/<path> redirects for explicit "latest" version goodness.
     url(r'^docs/(?P<project_slug>[-\w]+)/page/(?P<filename>.*)$',
-        'core.views.serve_docs',
-        {
-            'version_slug': None,
-            'lang_slug': None,
-        },
+        'core.views.redirect_page_with_filename',
         name='docs_detail'),
 
+    # Handle single version URLs
+    url(r'^docs/(?P<project_slug>[-\w]+)/(?P<filename>.*)$',
+        'core.views.serve_single_version_docs',
+        name='docs_detail'),
+
+    url(r'^i18n/', include('django.conf.urls.i18n')),
     url(r'^projects/', include('projects.urls.public')),
     url(r'^builds/', include('builds.urls')),
     url(r'^flagging/', include('basic.flagging.urls')),
@@ -79,6 +81,7 @@ urlpatterns = patterns(
         name='random_page'),
     url(r'^random/$', 'core.views.random_page', name='random_page'),
     url(r'^depth/$', 'core.views.queue_depth', name='queue_depth'),
+    url(r'^queue_info/$', 'core.views.queue_info', name='queue_info'),
     url(r'^live/$', 'core.views.live_builds', name='live_builds'),
     url(r'^500/$', 'core.views.divide_by_zero', name='divide_by_zero'),
     url(r'^filter/version/$',
@@ -100,7 +103,6 @@ urlpatterns = patterns(
         name='profiles_profile_edit'),
     url(r'^profiles/', include('profiles.urls')),
     url(r'^api/', include(v1_api.urls)),
-    url(r'^api/v2/', include(router.urls)),
     url(r'^api/v2/', include('restapi.urls')),
     url(r'^api-auth/', include('rest_framework.urls', namespace='rest_framework')),
     url(r'^feeds/new/$',

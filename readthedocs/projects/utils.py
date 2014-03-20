@@ -9,13 +9,35 @@ import logging
 from httplib2 import Http
 
 from django.conf import settings
-
 from distutils2.version import NormalizedVersion, suggest_normalized_version
 import redis
 
 
 log = logging.getLogger(__name__)
 
+def version_from_slug(slug, version):
+    from projects import tasks
+    from builds.models import Version
+    from tastyapi import apiv2 as api
+    if getattr(settings, 'DONT_HIT_DB', True):
+        version_data = api.version().get(project=slug, slug=version)['results'][0]
+        v = tasks.make_api_version(version_data)
+    else:
+        v = Version.objects.get(project__slug=slug, slug=version)
+    return v
+
+def symlink(project, version='latest'):
+    from projects import tasks
+    v = version_from_slug(project, version)
+    log.info("Symlinking %s" % v)
+    tasks.symlink_subprojects(v)
+    tasks.symlink_cnames(v)
+    tasks.symlink_translations(v)
+
+def update_static_metadata(project_pk):
+    from projects import tasks
+    log.info("Updating static metadata")
+    tasks.update_static_metadata(project_pk)
 
 def find_file(file):
     """Find matching filenames in the current directory and its subdirectories,
@@ -94,12 +116,14 @@ def _custom_slugify(data):
 def slugify_uniquely(model, initial, field, max_length, **filters):
     slug = _custom_slugify(initial)[:max_length]
     current = slug
+    """
     base_qs = model.objects.filter(**filters)
     index = 0
     while base_qs.filter(**{field: current}).exists():
         suffix = '-%s' % index
         current = '%s%s'  % (slug, suffix)
         index += 1
+    """
     return current
 
 

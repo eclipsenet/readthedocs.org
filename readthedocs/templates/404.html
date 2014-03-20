@@ -1,15 +1,18 @@
 {% extends "base.html" %}
-
 {% load i18n %}
 
-{% block title %}
-{% trans "Maze Found" %}
-{% endblock %}
+    {% block title %}
+      {% trans "Maze Found" %}
+    {% endblock %}
+
+    {% block header-wrapper %}
+      {% include "error_header.html" %}
+    {% endblock %}
 
 {% block content %}
 <pre>
 
-        \          {% trans "SORRY" %}            /
+        \          SORRY            /
          \                         /
           \    This page does     /
            ]   not exist yet.    [    ,'|

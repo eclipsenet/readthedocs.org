@@ -31,9 +31,6 @@ intersphinx_mapping = {
     'django': ('http://django.readthedocs.org/en/latest/', None),
     'sphinx': ('http://sphinx.readthedocs.org/en/latest/', None),
 }
-on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
-html_theme_path = ['_themes/sphinx_rtd_theme']
-html_theme = 'nature'
 # This doesn't exist since we aren't shipping any static files ourselves.
 #html_static_path = ['_static']
 htmlhelp_basename = 'ReadTheDocsdoc'
@@ -46,4 +43,13 @@ man_pages = [
      [u'Eric Holscher, Charlie Leifer, Bobby Grace'], 1)
 ]
 
-RTD_NEW_THEME = True
+exclude_patterns = [
+    #'api' # needed for ``make gettext`` to not die.
+]
+
+language = 'en'
+
+locale_dirs = [
+    'locale/',
+]
+gettext_compact = False

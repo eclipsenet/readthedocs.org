@@ -38,7 +38,7 @@ class BaseCLI(object):
     """
     Helper class for CLI-heavy classes.
     """
-    log_tmpl = 'VCS[{name}:{ident}]: {args}'
+    log_tmpl = u'VCS[{name}:{ident}]: {args}'
 
     def __call__(self, *args):
         return self.run(args)
@@ -51,13 +51,21 @@ class BaseCLI(object):
                                    stderr=subprocess.PIPE,
                                    cwd=self.working_dir, shell=False,
                                    env=self.env)
-        log.info(self.log_tmpl.format(ident=basename(self.working_dir),
-                                      name=self.name,
-                                      args=' '.join(args)))
+        try:
+            log.info(self.log_tmpl.format(ident=basename(self.working_dir),
+                                          name=self.name,
+                                          args=' '.join(args)))
+        except UnicodeDecodeError:
+            # >:x
+            pass
         stdout, stderr = process.communicate()
-        log.info(self.log_tmpl.format(ident=basename(self.working_dir),
-                                      name=self.name,
-                                      args=stdout))
+        try:
+            log.info(self.log_tmpl.format(ident=basename(self.working_dir),
+                                          name=self.name,
+                                          args=stdout))
+        except UnicodeDecodeError:
+            # >:x
+            pass
         return (process.returncode, stdout, stderr)
 
     @property

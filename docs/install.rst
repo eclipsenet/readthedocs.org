@@ -10,6 +10,7 @@ virtual environment will make the installation easier, and will help to avoid
 clutter in your system-wide libraries. You will also need Git_ in order to
 clone the repository.
 
+
 .. _Python: http://www.python.org/
 .. _virtualenv: http://pypi.python.org/pypi/virtualenv
 .. _Git: http://git-scm.com/
@@ -21,11 +22,20 @@ activate it::
     cd rtd
     source bin/activate
 
+
+You will need to verify that your pip version is higher than 1.5 you can do this as such::
+
+    pip --version
+    
+If this is not the case please update your pip version before continuing::
+
+    pip install --upgrade pip
+
 Create a folder in here, and clone the repository::
 
     mkdir checkouts
     cd checkouts
-    git clone http://github.com/rtfd/readthedocs.org.git
+    git clone https://github.com/rtfd/readthedocs.org.git
 
 Next, install the dependencies using ``pip`` (included with virtualenv_)::
 
@@ -75,7 +85,10 @@ with the name of any added project::
 
 Solr (Search) Setup
 -------------------
-Apache Solr is used to index and search documents. 
+
+Apache Solr is used to index and search documents.
+This is an optional requirement,
+and only necessary if you want to develop or use search.
 
 Additional python requirements necessary to use Solr::
 
@@ -117,7 +130,7 @@ What's available
 After registering with the site (or creating yourself a superuser account),
 you will be able to log in and view the `dashboard <http://readthedocs.org/dashboard/>`_.
 
-From the dashboard you can either create new documentation, or import your existing
+From the dashboard you can import your existing
 docs provided that they are in a git or mercurial repo.
 
 
@@ -140,3 +153,35 @@ docs you've already built.  Simply provide us with the clone url to your repo,
 we'll pull your code, extract your docs, and build them!  We make available
 a post-commit webhook that can be configured to update the docs on our site
 whenever you commit to your repo, effectively letting you 'set it and forget it'.
+
+
+Installation with Vagrant
+-------------------------
+
+It is also possible to run RTD using Vagrant_, using Vagrant v1.1+ and the
+`Salt plugin`_ for Vagrant_, by running the following commands::
+
+    vagrant plugin install vagrant-salt
+    vagrant up
+
+The Vagrant_ virtual machine will take a while to create and provision, and
+will leave a virtual machine running an instance of RTD with the following
+settings:
+
+:URL: http://localhost:8000
+:Username: docs
+:Password: docs
+
+.. _Vagrant: http://www.vagrantup.com/
+.. _Salt plugin: https://github.com/saltstack/salty-vagrant
+
+.. note::
+
+    The hostname `localhost` is used here, though it is possible to test RTD
+    and subdomains by adding entries in `/etc/hosts` for `readthedocs.org` and
+    your subdomains on readthedocs.org, pointing to `127.0.0.1` on the host
+    system. The site will be available at http://readthedocs.org:8000 with the
+    proper records set up.
+
+The repository is shared with the host file system, so edits can be made
+outside the virtual environment.

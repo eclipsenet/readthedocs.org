@@ -1,7 +1,7 @@
 """Tasks related to projects, including fetching repository code, cleaning
 ``conf.py`` files, and rebuilding documentation.
-
 """
+import datetime
 import fnmatch
 import os
 import re
@@ -10,7 +10,8 @@ import json
 import logging
 import operator
 
-from celery.decorators import task
+from celery.decorators import task, periodic_task
+from celery.schedules import crontab
 from django.conf import settings
 from django.contrib.sites.models import Site
 from django.core.mail import send_mail
@@ -32,14 +33,16 @@ from projects.utils import (purge_version, run,
                             make_api_version, make_api_project)
 from tastyapi import client as tastyapi_client
 from tastyapi import api, apiv2
-from core.utils import copy_to_app_servers, run_on_app_servers
+from core.utils import (copy_to_app_servers, copy_file_to_app_servers,
+                        run_on_app_servers)
 
 ghetto_hack = re.compile(
     r'(?P<key>.*)\s*=\s*u?\[?[\'\"](?P<value>.*)[\'\"]\]?')
 
 log = logging.getLogger(__name__)
 
-LOG_TEMPLATE = "(Build) [{project}:{version}] {msg}"
+LOG_TEMPLATE = u"(Build) [{project}:{version}] {msg}"
+HTML_ONLY = getattr(settings, 'HTML_ONLY_PROJECTS', ())
 
 @task
 def remove_dir(path):
@@ -57,7 +60,7 @@ def remove_dir(path):
 @restoring_chdir
 def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
                 search=True, version_pk=None, force=False, intersphinx=True,
-                api=None, **kwargs):
+                localmedia=True, api=None, **kwargs):
     """The main entry point for updating documentation.
 
     It handles all of the logic around whether a project is imported or we
@@ -79,9 +82,9 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
 
     project_data = api.project(pk).get()
     project = make_api_project(project_data)
-    #if 'edx-platform' in  project.repo:
-        # Skip edx for now
-        #return
+    if 'tryton' in  project.repo:
+        # Skip for now
+        return
 
     log.info(LOG_TEMPLATE.format(project=project.slug, version='', msg='Building'))
     if version_pk:
@@ -97,6 +100,7 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
             version_data = dict(
                 project='/api/v1/project/%s/' % project.pk,
                 slug='latest',
+                type='branch',
                 active=True,
                 verbose_name='latest',
                 identifier=branch,
@@ -144,9 +148,10 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
     except ProjectImportError, err:
         log.error(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg='Failed to import project; skipping build'), exc_info=True)
         build['state'] = 'finished'
-        build['setup_error'] = ('Failed to import project; skipping build.\n'
-                                'Please make sure your repo is correct and '
-                                'you have a conf.py')
+        build['setup_error'] = (
+            'Failed to import project; skipping build.\n'
+            '\nError\n-----\n\n%s' % err.message
+        )
         api.build(build['id']).put(build)
         return False
 
@@ -182,9 +187,9 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
     # This is only checking the results of the HTML build, as it's a canary
     try:
         results = build_docs(version_pk=version.pk, pdf=pdf, man=man,
-                             epub=epub, dash=dash, search=search,
+                             epub=epub, dash=dash, search=search, localmedia=localmedia,
                              record=record, force=force)
-        (html_results, latex_results, pdf_results, man_results, epub_results,
+        (html_results, latex_results, pdf_results, epub_results,
          dash_results, search_results) = results
         (ret, out, err) = html_results
     except Exception as e:
@@ -193,7 +198,6 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
         latex_results = (999, "Project build Failed", str(e))
         pdf_results = (999, "Project build Failed", str(e))
         # These variables aren't currently being used.
-        # man_results = (999, "Project build Failed", str(e))
         # epub_results = (999, "Project build Failed", str(e))
         # dash_results = (999, "Project build Failed", str(e))
         # search_results = (999, "Project build Failed", str(e))
@@ -205,18 +209,23 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
         build['output'] = html_results[1]
         build['error'] = html_results[2]
         build['state'] = 'finished'
+        build['exit_code'] = html_results[0]
         api.build(build['id']).put(build)
 
-        api.build.post(dict(
-            project='/api/v1/project/%s/' % project.pk,
-            version='/api/v1/version/%s/' % version.pk,
-            success=pdf_results[0] == 0,
-            type='pdf',
-            setup=latex_results[1],
-            setup_error=latex_results[2],
-            output=pdf_results[1],
-            error=pdf_results[2],
-        ))
+        try:
+            api.build.post(dict(
+                project='/api/v1/project/%s/' % project.pk,
+                version='/api/v1/version/%s/' % version.pk,
+                success=pdf_results[0] == 0,
+                type='pdf',
+                setup=latex_results[1],
+                setup_error=latex_results[2],
+                output=pdf_results[1],
+                error=pdf_results[2],
+                exit_code=pdf_results[0],
+            ))
+        except UnicodeDecodeError, e:
+            log.error(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg="Unable to post a new build"), exc_info=True)
 
     if version:
         # Mark version active on the site
@@ -229,7 +238,7 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
         try:
             api.version(version.pk).put(version_data)
         except Exception, e:
-            log.error(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg="Unable to post a new version"), exc_info=True)
+            log.error(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg="Unable to put a new version"), exc_info=True)
 
     # Build Finished, do house keeping bits
 
@@ -240,9 +249,16 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
             log.info(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg="Successful Build"))
             purge_version(version, subdomain=True,
                           mainsite=True, cname=True)
-            symlink_cname(version)
-            # This requires database access, must disable it for now.
+            symlink_cnames(version)
             symlink_translations(version)
+            symlink_subprojects(version)
+
+            if project.single_version:
+                symlink_single_version(version)
+            else:
+                remove_symlink_single_version(version)
+
+            # This requires database access, must disable it for now.
             #send_notifications(version, build)
             #log.info("Purged %s" % version)
         else:
@@ -258,7 +274,6 @@ def update_docs(pk, record=True, pdf=True, man=True, epub=True, dash=True,
         #clear_artifacts(version.pk)
 
     import_open_comparison(project)
-    import_crate(project)
 
     return True
 
@@ -275,20 +290,6 @@ def import_open_comparison(project):
             log.debug(LOG_TEMPLATE.format(project=project.slug, version='', msg="Failed import from Open Comparison"))
     except:
         log.debug("Failed import from Open Comparison", exc_info=True)
-
-
-def import_crate(project):
-    """
-    Try importing a Project model from Crate.
-    """
-    try:
-        result = tastyapi_client.import_crate(project)
-        if result:
-            log.debug(LOG_TEMPLATE.format(project=project.slug, version='', msg="Successful import from Crate"))
-        else:
-            log.debug(LOG_TEMPLATE.format(project=project.slug, version='', msg="Failed import from Crate"))
-    except:
-        log.debug(LOG_TEMPLATE.format(project=project.slug, version='', msg="Failed import from Crate"), exc_info=True)
 
 
 @task 
@@ -339,7 +340,7 @@ def update_imported_docs(version_pk, api=None):
     if not os.path.exists(project.doc_path):
         os.makedirs(project.doc_path)
 
-    with project.repo_lock(getattr(settings, 'REPO_LOCK_SECONDS', 30)):
+    with project.repo_lock(version, getattr(settings, 'REPO_LOCK_SECONDS', 30)):
         update_docs_output = {}
         if not project.vcs_repo():
             raise ProjectImportError(("Repo type '{0}' unknown"
@@ -369,17 +370,12 @@ def update_imported_docs(version_pk, api=None):
             version_repo = project.vcs_repo(version_slug)
             update_docs_output['checkout'] = version_repo.update()
 
-        # Ensure we have a conf file (an exception is raised if not)
-        project.conf_file(version.slug)
-
-
-
         # Do Virtualenv bits:
         if project.use_virtualenv:
             build_dir = os.path.join(project.venv_path(version=version_slug), 'build')
             if os.path.exists(build_dir):
                 log.info(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg='Removing existing build dir'))
-                shutil.remove_dir(build_dir)
+                shutil.rmtree(build_dir)
             if project.use_system_packages:
                 site_packages = '--system-site-packages'
             else:
@@ -403,7 +399,7 @@ def update_imported_docs(version_pk, api=None):
             else:
                 ignore_option = ''
             if project.python_interpreter != 'python3':
-                sphinx = 'sphinx==1.1.3'
+                sphinx = 'sphinx==1.2'
                 update_docs_output['sphinx'] = run(
                     ('{cmd} install -U {ignore_option} {sphinx} '
                      'virtualenv==1.10.1 setuptools==1.1 '
@@ -411,7 +407,7 @@ def update_imported_docs(version_pk, api=None):
                         cmd=project.venv_bin(version=version_slug, bin='pip'),
                         sphinx=sphinx, ignore_option=ignore_option))
             else:
-                sphinx = 'sphinx==1.1.3'
+                sphinx = 'sphinx==1.2'
                 # python 3 specific hax
                 update_docs_output['sphinx'] = run(
                     ('{cmd} install -U {ignore_option} {sphinx} '
@@ -466,7 +462,7 @@ def update_imported_docs(version_pk, api=None):
 
 
 @task
-def build_docs(version_pk, pdf, man, epub, dash, search, record, force):
+def build_docs(version_pk, pdf, man, epub, dash, search, localmedia, record, force):
     """
     This handles the actual building of the documentation and DB records
     """
@@ -474,10 +470,10 @@ def build_docs(version_pk, pdf, man, epub, dash, search, record, force):
     version = make_api_version(version_data)
     project = version.project
 
-    if not project.conf_file(version.slug):
+    if 'sphinx' in project.documentation_type and not project.conf_file(version.slug):
         return ('', 'Conf file not found.', -1)
 
-    with project.repo_lock(getattr(settings, 'REPO_LOCK_SECONDS', 30)):
+    with project.repo_lock(version, getattr(settings, 'REPO_LOCK_SECONDS', 30)):
 
         html_builder = builder_loading.get(project.documentation_type)(version)
         if force:
@@ -490,48 +486,61 @@ def build_docs(version_pk, pdf, man, epub, dash, search, record, force):
         fake_results = (999, "Project Skipped, Didn't build",
                         "Project Skipped, Didn't build")
         # Only build everything else if the html build changed.
-        if html_builder.changed and not project.skip:
-            if dash:
-                dash_builder = builder_loading.get('sphinx_dash')(version)
-                dash_results = dash_builder.build()
-                if dash_results[0] == 0:
-                    dash_builder.move()
-            else:
-                dash_results = fake_results
-            if pdf:
-                pdf_builder = builder_loading.get('sphinx_pdf')(version)
-                latex_results, pdf_results = pdf_builder.build()
-                # Always move pdf results even when there's an error.
-                #if pdf_results[0] == 0:
-                pdf_builder.move()
-            else:
-                pdf_results = latex_results = fake_results
-            if man:
-                man_builder = builder_loading.get('sphinx_man')(version)
-                man_results = man_builder.build()
-                if man_results[0] == 0:
-                    man_builder.move()
-            else:
-                man_results = fake_results
-            if epub:
-                epub_builder = builder_loading.get('sphinx_epub')(version)
-                epub_results = epub_builder.build()
-                if epub_results[0] == 0:
-                    epub_builder.move()
-            else:
-                epub_results = fake_results
-
+        if html_builder.changed and 'sphinx' in project.documentation_type:
+            # Search builder. Creates JSON from docs and sends it to the server.
             if search:
                 try:
-                    # BETA
                     search_builder = builder_loading.get('sphinx_search')(version)
                     search_results = search_builder.build()
                     if search_results[0] == 0:
+                        # Update search index
                         search_builder.upload()
-                except Exception, e:
-                    log.error(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg=e.message), exc_info=True)
+                        # Copy json for safe keeping
+                        search_builder.move()
+                except:
+                    log.error(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg="JSON Build Error"), exc_info=True)
+            # Local media builder for singlepage HTML download archive
+            if localmedia:
+                try:
+                    localmedia_builder = builder_loading.get('sphinx_singlehtmllocalmedia')(version)
+                    localmedia_results = localmedia_builder.build()
+                    if localmedia_results[0] == 0:
+                        localmedia_builder.move()
+                except:
+                    log.error(LOG_TEMPLATE.format(project=project.slug, version=version.slug, msg="Local Media HTML Build Error"), exc_info=True)
+                    
+            # Optional build steps 
+            if version.project.slug not in HTML_ONLY and not project.skip:
+                if pdf:
+                    pdf_builder = builder_loading.get('sphinx_pdf')(version)
+                    latex_results, pdf_results = pdf_builder.build()
+                    # Always move pdf results even when there's an error.
+                    #if pdf_results[0] == 0:
+                    pdf_builder.move()
+                else:
+                    pdf_results = latex_results = fake_results
+                if dash:
+                    dash_builder = builder_loading.get('sphinx_dash')(version)
+                    dash_results = dash_builder.build()
+                    if dash_results[0] == 0:
+                        dash_builder.move()
+                else:
+                    dash_results = fake_results
 
-    return (html_results, latex_results, pdf_results, man_results,
+                if epub:
+                    epub_builder = builder_loading.get('sphinx_epub')(version)
+                    epub_results = epub_builder.build()
+                    if epub_results[0] == 0:
+                        epub_builder.move()
+                else:
+                    epub_results = fake_results
+            else:
+                search_results = dash_results = latex_results = pdf_results = epub_results = (999, "Optional builds disabled", "Optional builds disabled")
+        else:
+            search_results = dash_results = latex_results = pdf_results = epub_results = (999, "Optional builds disabled", "Optional builds disabled")
+
+
+    return (html_results, latex_results, pdf_results,
             epub_results, dash_results, search_results)
 
 
@@ -570,20 +579,20 @@ def fileify(version_pk):
                             obj.save()
 
 
-#@periodic_task(run_every=crontab(hour="*", minute="*/5", day_of_week="*"))
-def update_docs_pull(record=False, pdf=False, man=False, force=False):
+#@periodic_task(run_every=crontab(hour="*/12", minute="*", day_of_week="*"))
+def update_mirror_docs():
     """
-    A high-level interface that will update all of the projects.
-
-    This is mainly used from a cronjob or management command.
+    A periodic task used to update all projects that we mirror.
     """
-    for version in Version.objects.filter(built=True):
-        try:
-            update_docs(pk=version.project.pk, version_pk=version.pk,
-                        record=record, pdf=pdf, man=man)
-        except Exception:
-            log.error("update_docs_pull failed", exc_info=True)
-
+    record = False
+    current = datetime.datetime.now()
+    # Only record one build a day, at midnight.
+    if current.hour == 0 and current.minute == 0:
+        record = True
+    data = apiv2.project().get(mirror=True, page_size=500)
+    for project_data in data['results']:
+        p = make_api_project(project_data)
+        update_docs(pk=p.pk, record=record)
 
 @task
 def unzip_files(dest_file, html_path):
@@ -641,31 +650,68 @@ def update_intersphinx(version_pk, api=None):
 
 
 def save_term(version, term, url):
-    redis_obj = redis.Redis(**settings.REDIS)
-    lang = "en"
-    project_slug = version.project.slug
-    version_slug = version.slug
-    redis_obj.sadd('redirects:v4:%s:%s:%s:%s' % (lang, version_slug,
-                                                 project_slug, term), url)
-    redis_obj.setnx('redirects:v4:%s:%s:%s:%s:%s' % (lang, version_slug,
-                                                     project_slug, term, url),
-                    1)
-
-
-def symlink_cname(version):
-    build_dir = version.project.rtd_build_path(version.slug)
-    # Chop off the version from the end.
-    build_dir = '/'.join(build_dir.split('/')[:-1])
-    redis_conn = redis.Redis(**settings.REDIS)
     try:
+        redis_obj = redis.Redis(**settings.REDIS)
+        lang = "en"
+        project_slug = version.project.slug
+        version_slug = version.slug
+        redis_obj.sadd('redirects:v4:%s:%s:%s:%s' % (lang, version_slug,
+                                                     project_slug, term), url)
+        redis_obj.setnx('redirects:v4:%s:%s:%s:%s:%s' % (lang, version_slug,
+                                                         project_slug, term, url),
+                        1)
+    except:
+        pass
+
+def symlink_cnames(version):
+    """
+    OLD
+    Link from HOME/user_builds/cnames/<cname> ->
+              HOME/user_builds/<project>/rtd-builds/
+    NEW
+    Link from HOME/user_builds/cnametoproject/<cname> ->
+              HOME/user_builds/<project>/
+    """
+    try:
+        redis_conn = redis.Redis(**settings.REDIS)
         cnames = redis_conn.smembers('rtd_slug:v1:%s' % version.project.slug)
     except redis.ConnectionError:
+        log.error(LOG_TEMPLATE.format(project=version.project.slug, version=version.slug, msg='Failed to symlink cnames, Redis error.'), exc_info=True)
         return
     for cname in cnames:
-        log.debug(LOG_TEMPLATE.format(project=version.project.slug, version=version.slug, msg="Symlinking %s" % cname))
-        symlink = version.project.rtd_cname_path(cname)
+        log.debug(LOG_TEMPLATE.format(project=version.project.slug, version=version.slug, msg="Symlinking CNAME: %s" % cname))
+        docs_dir = version.project.rtd_build_path(version.slug)
+        # Chop off the version from the end.
+        docs_dir = '/'.join(docs_dir.split('/')[:-1])
+        # Old symlink location -- Keep this here til we change nginx over
+        symlink = version.project.cnames_symlink_path(cname)
         run_on_app_servers('mkdir -p %s' % '/'.join(symlink.split('/')[:-1]))
-        run_on_app_servers('ln -nsf %s %s' % (build_dir, symlink))
+        run_on_app_servers('ln -nsf %s %s' % (docs_dir, symlink))
+        # New symlink location 
+        new_docs_dir = version.project.doc_path
+        new_cname_symlink = os.path.join(getattr(settings, 'SITE_ROOT'), 'cnametoproject', cname)
+        run_on_app_servers('mkdir -p %s' % '/'.join(new_cname_symlink.split('/')[:-1]))
+        run_on_app_servers('ln -nsf %s %s' % (new_docs_dir, new_cname_symlink))
+
+
+def symlink_subprojects(version):
+    """
+    Link from HOME/user_builds/project/subprojects/<project> ->
+              HOME/user_builds/<project>/rtd-builds/
+    """
+    # Subprojects
+    subprojects = apiv2.project(version.project.pk).subprojects.get()['subprojects']
+    for subproject_data in subprojects:
+        subproject_slug = subproject_data['slug']
+        log.debug(LOG_TEMPLATE.format(project=version.project.slug, version=version.slug, msg="Symlinking subproject: %s" % subproject_slug))
+
+        # The directory for this specific subproject
+        symlink = version.project.subprojects_symlink_path(subproject_slug)
+        run_on_app_servers('mkdir -p %s' % '/'.join(symlink.split('/')[:-1]))
+
+        # Where the actual docs live
+        docs_dir = os.path.join(settings.DOCROOT, subproject_slug, 'rtd-builds')
+        run_on_app_servers('ln -nsf %s %s' % (docs_dir, symlink))
 
 
 def symlink_translations(version):
@@ -673,30 +719,99 @@ def symlink_translations(version):
     Link from HOME/user_builds/project/translations/<lang> ->
               HOME/user_builds/<project>/rtd-builds/
     """
-    try:
-        translations = apiv2.project(version.project.pk).translations.get()['translations']
-        for translation_data in translations:
-            translation = make_api_project(translation_data)
-            # Get the first part of the symlink.
-            base_path = version.project.translations_path(translation.language)
-            translation_dir = translation.rtd_build_path(translation.slug)
-            # Chop off the version from the end.
-            translation_dir = '/'.join(translation_dir.split('/')[:-1])
-            log.debug(LOG_TEMPLATE.format(project=version.project.slug, version=version.slug, msg="Symlinking %s" % translation.language))
-            run_on_app_servers('mkdir -p %s' % '/'.join(base_path.split('/')[:-1]))
-            run_on_app_servers('ln -nsf %s %s' % (translation_dir, base_path))
-        # Hack in the en version for backwards compat
-        base_path = version.project.translations_path('en')
-        translation_dir = version.project.rtd_build_path(version.project.slug)
-        # Chop off the version from the end.
-        translation_dir = '/'.join(translation_dir.split('/')[:-1])
-        run_on_app_servers('mkdir -p %s' % '/'.join(base_path.split('/')[:-1]))
-        run_on_app_servers('ln -nsf %s %s' % (translation_dir, base_path))
-    except Exception, e:
-        log.error(LOG_TEMPLATE.format(project=version.project.slug, version=version.slug, msg="Error in symlink_translations: %s" % e.message))
-        # Don't fail on translation bits
-        pass
+    translations = apiv2.project(version.project.pk).translations.get()['translations']
+    for translation_data in translations:
+        translation_slug = translation_data['slug'].replace('_', '-')
+        translation_language = translation_data['language']
+        log.debug(LOG_TEMPLATE.format(project=version.project.slug, version=version.slug, msg="Symlinking translation: %s->%s" % (translation_language, translation_slug)))
 
+        # The directory for this specific translation
+        symlink = version.project.translations_symlink_path(translation_language)
+        run_on_app_servers('mkdir -p %s' % '/'.join(symlink.split('/')[:-1]))
+
+        # Where the actual docs live
+        docs_dir = os.path.join(settings.DOCROOT, translation_slug, 'rtd-builds')
+        run_on_app_servers('ln -nsf %s %s' % (docs_dir, symlink))
+
+    # Hack in the en version for backwards compat
+    symlink = version.project.translations_symlink_path('en')
+    run_on_app_servers('mkdir -p %s' % '/'.join(symlink.split('/')[:-1]))
+    docs_dir = os.path.join(version.project.doc_path, 'rtd-builds')
+    run_on_app_servers('ln -nsf %s %s' % (docs_dir, symlink))
+    # Add the main language project to nginx too
+    if version.project.language is not 'en':
+        symlink = version.project.translations_symlink_path(version.project.language)
+        run_on_app_servers('mkdir -p %s' % '/'.join(symlink.split('/')[:-1]))
+        docs_dir = os.path.join(settings.DOCROOT, version.project.slug.replace('_', '-'), 'rtd-builds')
+        run_on_app_servers('ln -nsf %s %s' % (docs_dir, symlink))
+
+def symlink_single_version(version):
+    """
+    Link from HOME/user_builds/<project>/single_version ->
+              HOME/user_builds/<project>/rtd-builds/<default_version>/
+    """
+    default_version = version.project.default_version
+    log.debug(LOG_TEMPLATE.format(project=version.project.slug, version=default_version, msg="Symlinking single_version"))
+
+    # The single_version directory
+    symlink = version.project.single_version_symlink_path()
+    run_on_app_servers('mkdir -p %s' % '/'.join(symlink.split('/')[:-1]))
+
+    # Where the actual docs live
+    docs_dir = os.path.join(settings.DOCROOT, version.project.slug, 'rtd-builds', default_version)
+    run_on_app_servers('ln -nsf %s %s' % (docs_dir, symlink))
+
+def remove_symlink_single_version(version):
+    """Remove single_version symlink"""
+    log.debug(LOG_TEMPLATE.format(
+        project=version.project.slug,
+        version=version.project.default_version,
+        msg="Removing symlink for single_version")
+    )
+    symlink = version.project.single_version_symlink_path()
+    run_on_app_servers('rm %s' % symlink)
+
+def update_static_metadata(project_pk):
+    """Update static metadata JSON file
+
+    Metadata settings include the following project settings:
+
+    version
+      The default version for the project, default: `latest`
+
+    language
+      The default language for the project, default: `en`
+
+    languages
+      List of languages built by linked translation projects.
+    """
+    project_base = apiv2.project(project_pk)
+    project_data = project_base.get()
+    project = make_api_project(project_data)
+    translations = project_base.translations.get()['translations']
+    languages = set([
+        translation['language']
+        for translation in translations
+        if 'language' in translation
+    ])
+    # Convert to JSON safe types
+    metadata = {
+        'version': project.default_version,
+        'language': project.language,
+        'languages': list(languages)
+    }
+    try:
+        path = project.static_metadata_path()
+        fh = open(path, 'w')
+        json.dump(metadata, fh)
+        fh.close()
+        copy_file_to_app_servers(path, path)
+    except IOError as e:
+        log.debug(LOG_TEMPLATE.format(
+            project=project.slug,
+            version='',
+            msg='Cannot write to metadata.json: {0}'.format(e)
+        ))
 
 def send_notifications(version, build):
     #zenircbot_notification(version.id)

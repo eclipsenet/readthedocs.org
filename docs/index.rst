@@ -15,58 +15,106 @@ The code is open source, and `available on github`_.
 .. _Mercurial: http://mercurial.selenic.com/
 .. _available on github: http://github.com/rtfd/readthedocs.org
 
-The documentation for the site is organized into two different sections below. One is for users of readthedocs.org, that is the first section. The next section is for users of the code that powers the site. All of the RTD code is open source, so you can run your own instance. 
+The documentation for the site is organized into a few different sections below:
+
+* :ref:`site-docs`
+* :ref:`feature-docs`
+* :ref:`dev-docs`
+* :ref:`design-docs`
+* :ref:`about-docs`
 
 
-Site Documentation
+.. _site-docs:
+
+User Documentation
 ------------------
 
 .. toctree::
     :maxdepth: 2
 
     getting_started
-    faq
-    support
-    features
-    theme
-    privacy
-    webhooks
-    alternate_domains
-    sponsors
     builds
-    talks
+    features
+    support
+    faq
 
-Designer Documentation
-----------------------
+.. _feature-docs:
+
+Features
+~~~~~~~~
+
 .. toctree::
     :maxdepth: 2
 
-    design
+    webhooks
+    alternate_domains
+    localization
+    vcs
+    canonical
+    redirects
+    versions
+    single_version
+    privacy
+
+.. _dev-docs:
 
 Developer Documentation
 -----------------------
+
 .. toctree::
     :maxdepth: 2
 
     install
-    todo
     contribute
-    architecture
-    settings
     tests
+    architecture
+    symlinks
+    settings
     i18n
     api
     api/index
 
+.. _design-docs:
+
+Designer Documentation
+----------------------
+
+.. toctree::
+    :maxdepth: 2
+
+    design
+    theme
+
+.. _about-docs:
+
+About Read the Docs
+-------------------
+
+.. toctree::
+    :maxdepth: 2
+
+    sponsors
+    talks
+
+
+.. Things that need more love before getting upgraded to the above list.
+
+.. _custom-docs:
+
 Custom install Documentation
 ----------------------------
+
 .. toctree::
     :maxdepth: 3
 
     custom_installs/index
+    settings
+
+.. _ops-docs:
 
 Operations Documentation
 ------------------------
+
 .. toctree::
     :maxdepth: 2
 

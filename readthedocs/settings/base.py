@@ -1,3 +1,4 @@
+# encoding: utf-8
 import os
 import djcelery
 djcelery.setup_loader()
@@ -7,6 +8,7 @@ _ = gettext = lambda s: s
 DEBUG = True
 TEMPLATE_DEBUG = DEBUG
 TASTYPIE_FULL_DEBUG = True
+LOG_DEBUG = False
 
 PRODUCTION_DOMAIN = 'readthedocs.org'
 USE_SUBDOMAIN = False
@@ -18,7 +20,7 @@ ADMINS = (
 
 MANAGERS = ADMINS
 
-SITE_ROOT = '/'.join(os.path.dirname(__file__).split('/')[0:-2])
+SITE_ROOT = '/'.join(os.path.dirname(os.path.realpath(__file__)).split('/')[0:-2])
 DOCROOT = os.path.join(SITE_ROOT, 'user_builds')
 UPLOAD_ROOT = os.path.join(SITE_ROOT, 'user_uploads')
 CNAME_ROOT = os.path.join(SITE_ROOT, 'cnames')
@@ -27,6 +29,7 @@ LOGS_ROOT = os.path.join(SITE_ROOT, 'logs')
 MEDIA_ROOT = '%s/media/' % (SITE_ROOT)
 MEDIA_URL = '/media/'
 ADMIN_MEDIA_PREFIX = '/media/admin/'
+
 # For 1.4
 STATIC_ROOT = os.path.join(SITE_ROOT, 'media/static/')
 STATIC_URL = '/static/'
@@ -50,9 +53,22 @@ TIME_ZONE = 'America/Chicago'
 LANGUAGE_CODE = 'en-us'
 LANGUAGES = (
     ('en', gettext('English')),
-    ('nb', gettext('Norwegian')),
+    ('es', gettext('Spanish')),
+    ('nb', gettext('Norwegian Bokmål')),
     ('fr', gettext('French')),
+    ('ru', gettext('Russian')),
+    ('de', gettext('German')),
+    ('gl', gettext('Galician')),
+    ('vi', gettext('Vietnamese')),
+    ('zh-cn', gettext('Chinese')),
+    ('zh-tw', gettext('Taiwanese')),
+    ('ja', gettext('Japanese')),
+    ('uk', gettext('Ukrainian')),
 )
+LOCALE_PATHS = [
+    os.path.join(SITE_ROOT, 'readthedocs', 'locale'),
+]
+
 
 USE_I18N = True
 USE_L10N = True
@@ -79,6 +95,7 @@ MIDDLEWARE_CLASSES = (
     # Hack
     # 'core.underscore_middleware.UnderscoreMiddleware',
     'core.middleware.SubdomainMiddleware',
+    'core.middleware.SingleVersionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     #'django.contrib.flatpages.middleware.FlatpageFallbackMiddleware',
 )
@@ -138,10 +155,12 @@ INSTALLED_APPS = [
     'core',
     'rtd_tests',
     'websupport',
+    'restapi',
 ]
 
 REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': ('rest_framework.permissions.IsAdminUser',),
+    'DEFAULT_FILTER_BACKENDS': ('rest_framework.filters.DjangoFilterBackend',),
     'PAGINATE_BY': 10
 }
 
@@ -191,7 +210,7 @@ IMPORT_EXTERNAL_DATA = True
 
 backup_count = 1000
 maxBytes = 500 * 100 * 100
-if DEBUG:
+if LOG_DEBUG:
     backup_count = 2
     maxBytes = 500 * 100 * 10
 
@@ -243,6 +262,14 @@ LOGGING = {
             'backupCount': backup_count,
             'formatter': 'standard',
         },
+        'middleware': {
+            'level': 'DEBUG',
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': os.path.join(LOGS_ROOT, "middleware.log"),
+            'maxBytes': maxBytes,
+            'backupCount': backup_count,
+            'formatter': 'standard',
+        },
         'restapi': {
             'level': 'DEBUG',
             'class': 'logging.handlers.RotatingFileHandler',
@@ -285,13 +312,18 @@ LOGGING = {
             'level': 'DEBUG',
             'propagate': False,
         },
+        'core.middleware': {
+            'handlers': ['middleware'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
         'restapi': {
             'handlers': ['restapi'],
             'level': 'DEBUG',
             'propagate': False,
         },
         'django.request': {
-            'handlers': ['mail_admins', 'exceptionlog'],
+            'handlers': ['exceptionlog'],
             'level': 'ERROR',
             'propagate': False,
         },
@@ -310,3 +342,6 @@ LOGGING = {
         },
     }
 }
+
+if DEBUG:
+    LOGGING['handlers']['console']['level'] = 'DEBUG'

@@ -7,6 +7,7 @@ import time
 env.runtime = 'production'
 env.hosts = ['newchimera.readthedocs.com',
              'newbuild.readthedocs.com',
+             'bari.readthedocs.com',
              'newasgard.readthedocs.com']
 env.user = 'docs'
 env.code_dir = '/home/docs/checkouts/readthedocs.org'
@@ -27,22 +28,22 @@ def ntpdate():
 @hosts(['newasgard.readthedocs.com', 'newchimera.readthedocs.com'])
 def nginx_logs():
     env.user = "root"
-    run("tail -f /var/log/nginx/*.log")
+    run("tail -F /var/log/nginx/*.log")
 
-@hosts(['newbuild.readthedocs.com'])
+@hosts(['newbuild.readthedocs.com', 'bari.readthedocs.com'])
 def celery_logs():
     env.user = "docs"
-    run("tail -f tail -f ~/log/celery.err")
+    run("tail -F tail -f ~/log/celery.err")
 
 @hosts(['newasgard.readthedocs.com', 'newchimera.readthedocs.com'])
 def logs():
     env.user = "docs"
-    run("tail -f %s/logs/*.log" % env.code_dir)
+    run("tail -F %s/logs/*.log" % env.code_dir)
 
 @hosts(['newasgard.readthedocs.com', 'newchimera.readthedocs.com'])
 def postcommit_logs():
     env.user = "docs"
-    run("tail -f %s/logs/postcommit.log" % env.code_dir)
+    run("tail -F %s/logs/postcommit.log" % env.code_dir)
 
 @hosts(['newasgard.readthedocs.com', 'newchimera.readthedocs.com'])
 def cat_postcommit_logs():
@@ -52,7 +53,17 @@ def cat_postcommit_logs():
 @hosts(['newasgard.readthedocs.com', 'newchimera.readthedocs.com'])
 def api_logs():
     env.user = "docs"
-    run("tail -f %s/logs/api.log" % env.code_dir)
+    run("tail -F %s/logs/api.log" % env.code_dir)
+
+@hosts(['newasgard.readthedocs.com', 'newchimera.readthedocs.com'])
+def web_logs(type):
+    """
+    Get logs from the web servers::
+
+    fab -P web_logs:middleware
+    """
+    env.user = "docs"
+    run("tail -F %s/logs/%s.log" % (env.code_dir, type))
 
 ## Normal bits
 
@@ -65,6 +76,16 @@ def i18n():
         local('tx push -s')
         local('./manage.py compilemessages')
 
+@hosts(['localhost'])
+def i18n_docs():
+    with lcd('docs'):
+        # Update our tanslations
+        local('tx pull -a')
+        local('sphinx-intl build')
+        # Push new ones
+        local('make gettext')
+        local('tx push -s')
+
 
 def push():
     "Push new code, but don't restart/reload."
@@ -76,8 +97,7 @@ def push():
 
 def update_requirements():
     "Update requirements in the virtualenv."
-    run(("%s/bin/pip install -i http://simple.crate.io/ -r "
-         "%s/deploy_requirements.txt") % (env.virtualenv, env.code_dir))
+    run("%s/bin/pip install -r %s/deploy_requirements.txt" % (env.virtualenv, env.code_dir))
 
 
 @hosts(['newchimera.readthedocs.com'])
@@ -112,7 +132,7 @@ def reload():
     run("supervisorctl update")
 
 
-@hosts(['newbuild.readthedocs.com'])
+@hosts(['newbuild.readthedocs.com', 'bari.readthedocs.com'])
 def celery():
     "Restart (or just start) the server"
     run("supervisorctl restart celery")
@@ -121,7 +141,8 @@ def celery():
 def pull():
     "Pull new code"
     with cd(env.code_dir):
-        run('git pull origin master')
+        run('git fetch')
+        run('git reset --hard origin/master')
 
 
 @runs_once
@@ -224,12 +245,13 @@ def update_index():
 
 @hosts('None')
 def update_theme():
-    with lcd(os.path.join(fabfile_dir, 'readthedocs', 'templates', 'sphinx')):
-        local('rm -rf theme_update_dir')
-        local('git clone https://github.com/snide/sphinx_rtd_theme.git theme_update_dir')
-        local('rm -rf sphinx_rtd_theme')
-        local('mv theme_update_dir/sphinx_rtd_theme .')
-        local('cp -r sphinx_rtd_theme/static/font/ %s' % os.path.join(fabfile_dir, 'media', 'font'))
-        local('cp sphinx_rtd_theme/static/css/badge_only.css %s' % os.path.join(fabfile_dir, 'media', 'css'))
-        local('cp sphinx_rtd_theme/static/css/theme.css %s' % os.path.join(fabfile_dir, 'media', 'css', 'sphinx_rtd_theme.css'))
-        local('rm -rf theme_update_dir')
+    theme_dir = os.path.join(fabfile_dir, 'readthedocs', 'templates', 'sphinx')
+    if not os.path.exists('/tmp/sphinx_rtd_theme'):
+        local('git clone https://github.com/snide/sphinx_rtd_theme.git /tmp/sphinx_rtd_theme')
+    with lcd('/tmp/sphinx_rtd_theme'):
+        local('git remote update')
+        local('git reset --hard origin/master ')
+        local('cp -r /tmp/sphinx_rtd_theme/sphinx_rtd_theme %s' % theme_dir)
+        local('cp -r /tmp/sphinx_rtd_theme/sphinx_rtd_theme/static/fonts/ %s' % os.path.join(fabfile_dir, 'media', 'font'))
+        local('cp /tmp/sphinx_rtd_theme/sphinx_rtd_theme/static/css/badge_only.css %s' % os.path.join(fabfile_dir, 'media', 'css'))
+        local('cp /tmp/sphinx_rtd_theme/sphinx_rtd_theme/static/css/theme.css %s' % os.path.join(fabfile_dir, 'media', 'css', 'sphinx_rtd_theme.css'))

@@ -10,7 +10,7 @@ from taggit.managers import TaggableManager
 
 from projects.models import Project
 from projects import constants
-from .constants import BUILD_STATE, BUILD_TYPES
+from .constants import BUILD_STATE, BUILD_TYPES, VERSION_TYPES
 
 
 class VersionManager(models.Manager):
@@ -81,6 +81,10 @@ class VersionManager(models.Manager):
 class Version(models.Model):
     project = models.ForeignKey(Project, verbose_name=_('Project'),
                                 related_name='versions')
+    type = models.CharField(
+        _('Type'), max_length=20,
+        choices=VERSION_TYPES, default='unknown',
+    )
     # used by the vcs backend
     identifier = models.CharField(_('Identifier'), max_length=255)
 
@@ -91,11 +95,10 @@ class Version(models.Model):
     active = models.BooleanField(_('Active'), default=False)
     built = models.BooleanField(_('Built'), default=False)
     uploaded = models.BooleanField(_('Uploaded'), default=False)
-    
     privacy_level = models.CharField(
         _('Privacy Level'), max_length=20, choices=constants.PRIVACY_CHOICES,
-        default='public', help_text=_("Level of privacy for this Version."))
-
+        default='public', help_text=_("Level of privacy for this Version.")
+    )
     tags = TaggableManager(blank=True)
     objects = VersionManager()
 
@@ -119,6 +122,17 @@ class Version(models.Model):
         if not self.built and not self.uploaded:
             return ''
         return self.project.get_docs_url(version_slug=self.slug)
+
+    def save(self, *args, **kwargs):
+        """
+        Add permissions to the Version for all owners on save.
+        """
+        obj = super(Version, self).save(*args, **kwargs)
+        for owner in self.project.users.all():
+            assign('view_version', owner, self)
+        self.project.sync_supported_versions()
+        return obj
+
 
     @property 
     def remote_slug(self):
@@ -146,14 +160,12 @@ class Version(models.Model):
                 'filename': ''
             })
 
-    def save(self, *args, **kwargs):
-        """
-        Add permissions to the Version for all owners on save.
-        """
-        obj = super(Version, self).save(*args, **kwargs)
-        for owner in self.project.users.all():
-            assign('view_version', owner, self)
-        return obj
+    def get_subproject_url(self):
+        return "/projects/%s/%s/%s/" % (
+            self.project.slug,
+            self.project.language,
+            self.slug,
+        )
 
     def get_downloads(self, pretty=False):
         project = self.project
@@ -172,8 +184,8 @@ class Version(models.Model):
                 data['htmlzip_url'] = project.get_htmlzip_url(self.slug)
             if project.has_epub(self.slug):
                 data['epub_url'] = project.get_epub_url(self.slug)
-            if project.has_manpage(self.slug):
-                data['manpage_url'] = project.get_manpage_url(self.slug)
+            #if project.has_manpage(self.slug):
+                #data['manpage_url'] = project.get_manpage_url(self.slug)
             if project.has_dash(self.slug):
                 data['dash_url'] = project.get_dash_url(self.slug)
                 data['dash_feed_url'] = project.get_dash_feed_url(self.slug)
@@ -283,6 +295,8 @@ class Build(models.Model):
     setup_error = models.TextField(_('Setup error'), null=True, blank=True)
     output = models.TextField(_('Output'), default='', blank=True)
     error = models.TextField(_('Error'), default='', blank=True)
+    exit_code = models.IntegerField(_('Exit code'), max_length=3, null=True,
+                                    blank=True)
 
     class Meta:
         ordering = ['-date']

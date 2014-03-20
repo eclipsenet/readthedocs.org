@@ -7,6 +7,8 @@ from .backends import (
     sphinx_pdf,
     sphinx_dash,
     sphinx_search,
+    sphinx_singlehtml,
+    mkdocs,
 )
 
 
@@ -18,4 +20,7 @@ loading = {'sphinx': sphinx.Builder,
            'sphinx_pdf': sphinx_pdf.Builder,
            'sphinx_dash': sphinx_dash.Builder,
            'sphinx_search': sphinx_search.Builder,
+           'sphinx_singlehtml': sphinx_singlehtml.Builder,
+           'sphinx_singlehtmllocalmedia': sphinx_singlehtml.LocalMediaBuilder,
+           'mkdocs': mkdocs.Builder,
            }

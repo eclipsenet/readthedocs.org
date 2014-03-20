@@ -4,7 +4,7 @@ documentation and header rendering, and server errors.
 """
 
 from django.contrib.auth.models import User
-from django.core.urlresolvers import NoReverseMatch, reverse
+from django.core.urlresolvers import reverse
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseRedirect, Http404, HttpResponseNotFound
 from django.shortcuts import render_to_response, get_object_or_404, redirect
@@ -15,13 +15,13 @@ from django.views.generic import TemplateView
 
 from haystack.query import EmptySearchQuerySet
 from haystack.query import SearchQuerySet
+from celery.task.control import inspect
 
 from builds.models import Build
 from builds.models import Version
 from core.forms import FacetedSearchForm
 from projects.models import Project, ImportedFile, ProjectRelationship
 from projects.tasks import update_docs, remove_dir
-from projects.utils import highest_version
 
 import json
 import mimetypes
@@ -58,6 +58,35 @@ def queue_depth(request):
     r = redis.Redis(**settings.REDIS)
     return HttpResponse(r.llen('celery'))
 
+def queue_info(request):
+    i = inspect()
+    active_pks = []
+    reserved_pks = []
+    resp = ""
+
+    active = i.active()
+    if active:
+        try:
+            for obj in active['build']:
+                kwargs = eval(obj['kwargs'])
+                active_pks.append(str(kwargs['pk']))
+            active_resp = "Active: %s  " % " ".join(active_pks)
+            resp += active_resp
+        except Exception, e:
+            resp += str(e)
+
+    reserved = i.reserved()
+    if reserved:
+        try:
+            for obj in reserved['build']:
+                kwrags = eval(obj['kwargs'])
+                reserved_pks.append(str(kwargs['pk']))
+            reserved_resp = " | Reserved: %s" % " ".join(reserved_pks)
+            resp += reserved_resp
+        except Exception, e:
+            resp += str(e)
+        
+    return HttpResponse(resp)
 
 def live_builds(request):
     builds = Build.objects.filter(state='building')[:5]
@@ -128,9 +157,11 @@ def _build_branches(project, branch_list):
 
 def _build_url(url, branches):
     try:
-        projects = Project.objects.filter(repo__contains=url)
+        projects = Project.objects.filter(repo__endswith=url)
         if not projects.count():
-            raise NoProjectException()
+            projects = Project.objects.filter(repo__endswith=url + '.git')
+            if not projects.count():
+                raise NoProjectException()
         for project in projects:
             (to_build, not_building) = _build_branches(project, branches)
         if to_build:
@@ -189,9 +220,13 @@ def github_build(request):
 @csrf_view_exempt
 def bitbucket_build(request):
     if request.method == 'POST':
-        obj = json.loads(request.POST['payload'])
+        payload = request.POST.get('payload')
+        pc_log.info("(Incoming Bitbucket Build) Raw: %s" % payload)
+        if not payload:
+            return HttpResponseNotFound('Invalid Request')
+        obj = json.loads(payload)
         rep = obj['repository']
-        branches = [rec['branch'] for rec in obj['commits']]
+        branches = [rec.get('branch', '') for rec in obj['commits']]
         ghetto_url = "%s%s" % ("bitbucket.org",  rep['absolute_url'].rstrip('/'))
         pc_log.info("(Incoming Bitbucket Build) %s [%s]" % (ghetto_url, ' '.join(branches)))
         pc_log.info("(Incoming Bitbucket Build) JSON: \n\n%s\n\n" % obj)
@@ -199,7 +234,7 @@ def bitbucket_build(request):
             return _build_url(ghetto_url, branches)
         except NoProjectException:
             pc_log.error("(Incoming Bitbucket Build) Repo not found:  %s" % ghetto_url)
-            return HttpResponseNotFound('Repo not found' % ghetto_url)
+            return HttpResponseNotFound('Repo not found: %s' % ghetto_url)
 
 
 @csrf_view_exempt
@@ -218,60 +253,6 @@ def generic_build(request, pk=None):
             pc_log.info("(Incoming Generic Build) %s [%s]" % (project.slug, 'latest'))
             update_docs.delay(pk=pk, force=True)
     return redirect('builds_project_list', project.slug)
-
-
-def subdomain_handler(request, lang_slug=None, version_slug=None, filename=''):
-    """This provides the fall-back routing for subdomain requests.
-
-    This was made primarily to redirect old subdomain's to their version'd
-    brothers.
-
-    """
-    project = get_object_or_404(Project, slug=request.slug)
-    # Don't add index.html for htmldir.
-    if not filename and project.documentation_type != 'sphinx_htmldir':
-        filename = "index.html"
-    if version_slug is None:
-        # Handle / on subdomain.
-        default_version = project.get_default_version()
-        url = reverse(serve_docs, kwargs={
-            'version_slug': default_version,
-            'lang_slug': project.language,
-            'filename': filename
-        })
-        return HttpResponseRedirect(url)
-    if version_slug and lang_slug is None:
-        # Handle /version/ on subdomain.
-        aliases = project.aliases.filter(from_slug=version_slug)
-        # Handle Aliases.
-        if aliases.count():
-            if aliases[0].largest:
-                highest_ver = highest_version(project.versions.filter(
-                    slug__contains=version_slug, active=True))
-                version_slug = highest_ver[0].slug
-            else:
-                version_slug = aliases[0].to_slug
-            url = reverse(serve_docs, kwargs={
-                'version_slug': version_slug,
-                'lang_slug': project.language,
-                'filename': filename
-            })
-        else:
-            try:
-                url = reverse(serve_docs, kwargs={
-                    'version_slug': version_slug,
-                    'lang_slug': project.language,
-                    'filename': filename
-                })
-            except NoReverseMatch:
-                raise Http404
-        return HttpResponseRedirect(url)
-    # Serve normal docs
-    return serve_docs(request=request,
-                      project_slug=project.slug,
-                      lang_slug=lang_slug,
-                      version_slug=version_slug,
-                      filename=filename)
 
 def subproject_list(request):
     project_slug = request.slug
@@ -308,33 +289,94 @@ def subproject_serve_docs(request, project_slug, lang_slug=None,
                                                       parent_slug))
         raise Http404("Subproject does not exist")
 
+def default_docs_kwargs(request, project_slug=None):
+    """
+    Return kwargs used to reverse lookup a project's default docs URL.
+
+    Determining which URL to redirect to is done based on the kwargs
+    passed to reverse(serve_docs, kwargs).  This function populates
+    kwargs for the default docs for a project, and sets appropriate keys
+    depending on whether request is for a subdomain URL, or a non-subdomain
+    URL.
+
+    """
+    if project_slug:
+        try:
+            proj = Project.objects.get(slug=project_slug)
+        except (Project.DoesNotExist, ValueError):
+            # Try with underscore, for legacy
+            try:
+                proj = Project.objects.get(slug=project_slug.replace('-', '_'))
+            except (Project.DoesNotExist):
+                proj = None
+    else:
+        # If project_slug isn't in URL pattern, it's set in subdomain
+        # middleware as request.slug.
+        try:
+            proj = Project.objects.get(slug=request.slug)
+        except (Project.DoesNotExist, ValueError):
+            # Try with underscore, for legacy
+            try:
+                proj = Project.objects.get(slug=request.slug.replace('-', '_'))
+            except (Project.DoesNotExist):
+                proj = None
+    if not proj:
+        raise Http404("Project slug not found")
+    version_slug = proj.get_default_version()
+    kwargs = {
+        'project_slug': project_slug,
+        'version_slug': version_slug,
+        'lang_slug': proj.language,
+        'filename': ''
+    }
+    # Don't include project_slug for subdomains.
+    # That's how reverse(serve_docs, ...) differentiates subdomain
+    # views from non-subdomain views.
+    if project_slug is None:
+        del kwargs['project_slug']
+    return kwargs
+
+def redirect_lang_slug(request, lang_slug, project_slug=None):
+    """Redirect /en/ to /en/latest/."""
+    kwargs = default_docs_kwargs(request, project_slug)
+    kwargs['lang_slug'] = lang_slug
+    url = reverse(serve_docs, kwargs=kwargs)
+    return HttpResponseRedirect(url)
+
+def redirect_version_slug(request, version_slug, project_slug=None):
+    """Redirect /latest/ to /en/latest/."""
+    kwargs = default_docs_kwargs(request, project_slug)
+    kwargs['version_slug'] = version_slug
+    url = reverse(serve_docs, kwargs=kwargs)
+    return HttpResponseRedirect(url)
+
+def redirect_project_slug(request, project_slug=None):
+    """Redirect / to /en/latest/."""
+    kwargs = default_docs_kwargs(request, project_slug)
+    url = reverse(serve_docs, kwargs=kwargs)
+    return HttpResponseRedirect(url)
+
+def redirect_page_with_filename(request, filename, project_slug=None):
+    """Redirect /page/file.html to /en/latest/file.html."""
+    kwargs = default_docs_kwargs(request, project_slug)
+    kwargs['filename'] = filename
+    url = reverse(serve_docs, kwargs=kwargs)
+    return HttpResponseRedirect(url)
 
 def serve_docs(request, lang_slug, version_slug, filename, project_slug=None):
     if not project_slug:
         project_slug = request.slug
     proj = get_object_or_404(Project, slug=project_slug)
-
-    # Redirects
-    if not version_slug or not lang_slug:
-        version_slug = proj.get_default_version()
-        url = reverse(serve_docs, kwargs={
-            'project_slug': project_slug,
-            'version_slug': version_slug,
-            'lang_slug': proj.language,
-            'filename': filename
-        })
-        return HttpResponseRedirect(url)
-
     ver = get_object_or_404(Version, project__slug=project_slug,
                             slug=version_slug)
+
     # Auth checks
-    if ver not in proj.versions.public(request.user, proj):
+    if ver not in proj.versions.public(request.user, proj, only_active=False):
         res = HttpResponse("You don't have access to this version.")
         res.status_code = 401
         return res
 
-    # Normal handling
-
+    # Figure out actual file to serve
     if not filename:
         filename = "index.html"
     # This is required because we're forming the filenames outselves instead of
@@ -353,8 +395,10 @@ def serve_docs(request, lang_slug, version_slug, filename, project_slug=None):
     if lang_slug == proj.language:
         basepath = proj.rtd_build_path(version_slug)
     else:
-        basepath = proj.translations_path(lang_slug)
+        basepath = proj.translations_symlink_path(lang_slug)
         basepath = os.path.join(basepath, version_slug)
+
+    # Serve file
     log.info('Serving %s for %s' % (filename, proj))
     if not settings.DEBUG:
         fullpath = os.path.join(basepath, filename)
@@ -374,6 +418,19 @@ def serve_docs(request, lang_slug, version_slug, filename, project_slug=None):
         return serve(request, filename, basepath)
 
 
+def serve_single_version_docs(request, filename, project_slug=None):
+    if not project_slug:
+        project_slug = request.slug
+    proj = get_object_or_404(Project, slug=project_slug)
+
+    # This function only handles single version projects
+    if not proj.single_version:
+        raise Http404
+
+    return serve_docs(request, proj.language, proj.default_version,
+                      filename, project_slug)
+
+
 def server_error(request, template_name='500.html'):
     """
     A simple 500 handler so we get media
@@ -386,7 +443,7 @@ def server_error(request, template_name='500.html'):
 
 def server_error_404(request, template_name='404.html'):
     """
-    A simple 500 handler so we get media
+    A simple 404 handler so we get media
     """
     r = render_to_response(template_name,
                            context_instance=RequestContext(request))
